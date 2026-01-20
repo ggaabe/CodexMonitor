@@ -542,6 +542,9 @@ export function useLayoutNodes(options: LayoutNodesOptions): LayoutNodesResult {
     <TabBar activeTab={options.activeTab} onSelect={options.onSelectTab} />
   );
 
+  const sidebarSelectedDiffPath =
+    options.centerMode === "diff" ? options.selectedDiffPath : null;
+
   let gitDiffPanelNode: ReactNode;
   if (options.filePanelMode === "files" && options.activeWorkspace) {
     gitDiffPanelNode = (
@@ -593,7 +596,7 @@ export function useLayoutNodes(options: LayoutNodesOptions): LayoutNodesResult {
         stagedFiles={options.gitStatus.stagedFiles}
         unstagedFiles={options.gitStatus.unstagedFiles}
         onSelectFile={options.onSelectDiff}
-        selectedPath={options.selectedDiffPath}
+        selectedPath={sidebarSelectedDiffPath}
         logEntries={options.gitLogEntries}
         logTotal={options.gitLogTotal}
         logAhead={options.gitLogAhead}
