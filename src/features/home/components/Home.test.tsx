@@ -12,7 +12,7 @@ const baseProps = {
   isLoadingLocalUsage: false,
   localUsageError: null,
   onRefreshLocalUsage: vi.fn(),
-  usageMetric: "tokens",
+  usageMetric: "tokens" as const,
   onUsageMetricChange: vi.fn(),
   usageWorkspaceId: null,
   usageWorkspaceOptions: [],
