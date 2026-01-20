@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use tauri::{AppHandle, State};
 use tokio::process::Command;
+use tokio::sync::mpsc;
 use tokio::time::timeout;
 
 pub(crate) use crate::backend::app_server::WorkspaceSession;
@@ -15,6 +16,7 @@ use crate::backend::app_server::{
 };
 use crate::codex_home::{resolve_default_codex_home, resolve_workspace_codex_home};
 use crate::event_sink::TauriEventSink;
+use crate::remote_backend;
 use crate::rules;
 use crate::state::AppState;
 use crate::types::WorkspaceEntry;
@@ -133,7 +135,18 @@ pub(crate) async fn codex_doctor(
 pub(crate) async fn start_thread(
     workspace_id: String,
     state: State<'_, AppState>,
+    app: AppHandle,
 ) -> Result<Value, String> {
+    if remote_backend::is_remote_mode(&*state).await {
+        return remote_backend::call_remote(
+            &*state,
+            app,
+            "start_thread",
+            json!({ "workspaceId": workspace_id }),
+        )
+        .await;
+    }
+
     let sessions = state.sessions.lock().await;
     let session = sessions
         .get(&workspace_id)
@@ -150,7 +163,18 @@ pub(crate) async fn resume_thread(
     workspace_id: String,
     thread_id: String,
     state: State<'_, AppState>,
+    app: AppHandle,
 ) -> Result<Value, String> {
+    if remote_backend::is_remote_mode(&*state).await {
+        return remote_backend::call_remote(
+            &*state,
+            app,
+            "resume_thread",
+            json!({ "workspaceId": workspace_id, "threadId": thread_id }),
+        )
+        .await;
+    }
+
     let sessions = state.sessions.lock().await;
     let session = sessions
         .get(&workspace_id)
@@ -167,7 +191,18 @@ pub(crate) async fn list_threads(
     cursor: Option<String>,
     limit: Option<u32>,
     state: State<'_, AppState>,
+    app: AppHandle,
 ) -> Result<Value, String> {
+    if remote_backend::is_remote_mode(&*state).await {
+        return remote_backend::call_remote(
+            &*state,
+            app,
+            "list_threads",
+            json!({ "workspaceId": workspace_id, "cursor": cursor, "limit": limit }),
+        )
+        .await;
+    }
+
     let sessions = state.sessions.lock().await;
     let session = sessions
         .get(&workspace_id)
@@ -184,7 +219,18 @@ pub(crate) async fn archive_thread(
     workspace_id: String,
     thread_id: String,
     state: State<'_, AppState>,
+    app: AppHandle,
 ) -> Result<Value, String> {
+    if remote_backend::is_remote_mode(&*state).await {
+        return remote_backend::call_remote(
+            &*state,
+            app,
+            "archive_thread",
+            json!({ "workspaceId": workspace_id, "threadId": thread_id }),
+        )
+        .await;
+    }
+
     let sessions = state.sessions.lock().await;
     let session = sessions
         .get(&workspace_id)
@@ -206,7 +252,27 @@ pub(crate) async fn send_user_message(
     images: Option<Vec<String>>,
     collaboration_mode: Option<Value>,
     state: State<'_, AppState>,
+    app: AppHandle,
 ) -> Result<Value, String> {
+    if remote_backend::is_remote_mode(&*state).await {
+        return remote_backend::call_remote(
+            &*state,
+            app,
+            "send_user_message",
+            json!({
+                "workspaceId": workspace_id,
+                "threadId": thread_id,
+                "text": text,
+                "model": model,
+                "effort": effort,
+                "accessMode": access_mode,
+                "images": images,
+                "collaborationMode": collaboration_mode,
+            }),
+        )
+        .await;
+    }
+
     let sessions = state.sessions.lock().await;
     let session = sessions
         .get(&workspace_id)
@@ -274,7 +340,18 @@ pub(crate) async fn send_user_message(
 pub(crate) async fn collaboration_mode_list(
     workspace_id: String,
     state: State<'_, AppState>,
+    app: AppHandle,
 ) -> Result<Value, String> {
+    if remote_backend::is_remote_mode(&*state).await {
+        return remote_backend::call_remote(
+            &*state,
+            app,
+            "collaboration_mode_list",
+            json!({ "workspaceId": workspace_id }),
+        )
+        .await;
+    }
+
     let sessions = state.sessions.lock().await;
     let session = sessions
         .get(&workspace_id)
@@ -290,7 +367,18 @@ pub(crate) async fn turn_interrupt(
     thread_id: String,
     turn_id: String,
     state: State<'_, AppState>,
+    app: AppHandle,
 ) -> Result<Value, String> {
+    if remote_backend::is_remote_mode(&*state).await {
+        return remote_backend::call_remote(
+            &*state,
+            app,
+            "turn_interrupt",
+            json!({ "workspaceId": workspace_id, "threadId": thread_id, "turnId": turn_id }),
+        )
+        .await;
+    }
+
     let sessions = state.sessions.lock().await;
     let session = sessions
         .get(&workspace_id)
@@ -309,7 +397,23 @@ pub(crate) async fn start_review(
     target: Value,
     delivery: Option<String>,
     state: State<'_, AppState>,
+    app: AppHandle,
 ) -> Result<Value, String> {
+    if remote_backend::is_remote_mode(&*state).await {
+        return remote_backend::call_remote(
+            &*state,
+            app,
+            "start_review",
+            json!({
+                "workspaceId": workspace_id,
+                "threadId": thread_id,
+                "target": target,
+                "delivery": delivery,
+            }),
+        )
+        .await;
+    }
+
     let sessions = state.sessions.lock().await;
     let session = sessions
         .get(&workspace_id)
@@ -329,7 +433,18 @@ pub(crate) async fn start_review(
 pub(crate) async fn model_list(
     workspace_id: String,
     state: State<'_, AppState>,
+    app: AppHandle,
 ) -> Result<Value, String> {
+    if remote_backend::is_remote_mode(&*state).await {
+        return remote_backend::call_remote(
+            &*state,
+            app,
+            "model_list",
+            json!({ "workspaceId": workspace_id }),
+        )
+        .await;
+    }
+
     let sessions = state.sessions.lock().await;
     let session = sessions
         .get(&workspace_id)
@@ -342,7 +457,18 @@ pub(crate) async fn model_list(
 pub(crate) async fn account_rate_limits(
     workspace_id: String,
     state: State<'_, AppState>,
+    app: AppHandle,
 ) -> Result<Value, String> {
+    if remote_backend::is_remote_mode(&*state).await {
+        return remote_backend::call_remote(
+            &*state,
+            app,
+            "account_rate_limits",
+            json!({ "workspaceId": workspace_id }),
+        )
+        .await;
+    }
+
     let sessions = state.sessions.lock().await;
     let session = sessions
         .get(&workspace_id)
@@ -356,7 +482,18 @@ pub(crate) async fn account_rate_limits(
 pub(crate) async fn skills_list(
     workspace_id: String,
     state: State<'_, AppState>,
+    app: AppHandle,
 ) -> Result<Value, String> {
+    if remote_backend::is_remote_mode(&*state).await {
+        return remote_backend::call_remote(
+            &*state,
+            app,
+            "skills_list",
+            json!({ "workspaceId": workspace_id }),
+        )
+        .await;
+    }
+
     let sessions = state.sessions.lock().await;
     let session = sessions
         .get(&workspace_id)
@@ -373,12 +510,48 @@ pub(crate) async fn respond_to_server_request(
     request_id: u64,
     result: Value,
     state: State<'_, AppState>,
+    app: AppHandle,
 ) -> Result<(), String> {
+    if remote_backend::is_remote_mode(&*state).await {
+        remote_backend::call_remote(
+            &*state,
+            app,
+            "respond_to_server_request",
+            json!({ "workspaceId": workspace_id, "requestId": request_id, "result": result }),
+        )
+        .await?;
+        return Ok(());
+    }
+
     let sessions = state.sessions.lock().await;
     let session = sessions
         .get(&workspace_id)
         .ok_or("workspace not connected")?;
     session.send_response(request_id, result).await
+}
+
+/// Gets the diff content for commit message generation
+#[tauri::command]
+pub(crate) async fn get_commit_message_prompt(
+    workspace_id: String,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    // Get the diff from git
+    let diff = crate::git::get_workspace_diff(&workspace_id, &state).await?;
+
+    if diff.trim().is_empty() {
+        return Err("No changes to generate commit message for".to_string());
+    }
+
+    let prompt = format!(
+        "Generate a concise git commit message for the following changes. \
+Follow conventional commit format (e.g., feat:, fix:, refactor:, docs:, etc.). \
+Focus on the 'why' rather than the 'what'. Keep the summary line under 72 characters. \
+Only output the commit message, nothing else.\n\n\
+Changes:\n{diff}"
+    );
+
+    Ok(prompt)
 }
 
 #[tauri::command]
@@ -420,4 +593,170 @@ pub(crate) async fn remember_approval_rule(
         "ok": true,
         "rulesPath": rules_path,
     }))
+}
+
+/// Generates a commit message in the background without showing in the main chat
+#[tauri::command]
+pub(crate) async fn generate_commit_message(
+    workspace_id: String,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    // Get the diff from git
+    let diff = crate::git::get_workspace_diff(&workspace_id, &state).await?;
+
+    if diff.trim().is_empty() {
+        return Err("No changes to generate commit message for".to_string());
+    }
+
+    let prompt = format!(
+        "Generate a concise git commit message for the following changes. \
+Follow conventional commit format (e.g., feat:, fix:, refactor:, docs:, etc.). \
+Focus on the 'why' rather than the 'what'. Keep the summary line under 72 characters. \
+Only output the commit message, nothing else.\n\n\
+Changes:\n{diff}"
+    );
+
+    // Get the session
+    let session = {
+        let sessions = state.sessions.lock().await;
+        sessions
+            .get(&workspace_id)
+            .ok_or("workspace not connected")?
+            .clone()
+    };
+
+    // Create a background thread
+    let thread_params = json!({
+        "cwd": session.entry.path,
+        "approvalPolicy": "never"  // Never ask for approval in background
+    });
+    let thread_result = session.send_request("thread/start", thread_params).await?;
+
+    // Handle error response
+    if let Some(error) = thread_result.get("error") {
+        let error_msg = error
+            .get("message")
+            .and_then(|m| m.as_str())
+            .unwrap_or("Unknown error starting thread");
+        return Err(error_msg.to_string());
+    }
+
+    // Extract threadId - try multiple paths since response format may vary
+    let thread_id = thread_result
+        .get("result")
+        .and_then(|r| r.get("threadId"))
+        .or_else(|| thread_result.get("result").and_then(|r| r.get("thread")).and_then(|t| t.get("id")))
+        .or_else(|| thread_result.get("threadId"))
+        .or_else(|| thread_result.get("thread").and_then(|t| t.get("id")))
+        .and_then(|t| t.as_str())
+        .ok_or_else(|| format!("Failed to get threadId from thread/start response: {:?}", thread_result))?
+        .to_string();
+
+    // Create channel for receiving events
+    let (tx, mut rx) = mpsc::unbounded_channel::<Value>();
+
+    // Register callback for this thread
+    {
+        let mut callbacks = session.background_thread_callbacks.lock().await;
+        callbacks.insert(thread_id.clone(), tx);
+    }
+
+    // Start a turn with the commit message prompt
+    let turn_params = json!({
+        "threadId": thread_id,
+        "input": [{ "type": "text", "text": prompt }],
+        "cwd": session.entry.path,
+        "approvalPolicy": "never",
+        "sandboxPolicy": { "type": "readOnly" },
+    });
+    let turn_result = session.send_request("turn/start", turn_params).await;
+    let turn_result = match turn_result {
+        Ok(result) => result,
+        Err(error) => {
+            // Clean up if turn fails to start
+            {
+                let mut callbacks = session.background_thread_callbacks.lock().await;
+                callbacks.remove(&thread_id);
+            }
+            let archive_params = json!({ "threadId": thread_id.as_str() });
+            let _ = session.send_request("thread/archive", archive_params).await;
+            return Err(error);
+        }
+    };
+
+    if let Some(error) = turn_result.get("error") {
+        let error_msg = error
+            .get("message")
+            .and_then(|m| m.as_str())
+            .unwrap_or("Unknown error starting turn");
+        {
+            let mut callbacks = session.background_thread_callbacks.lock().await;
+            callbacks.remove(&thread_id);
+        }
+        let archive_params = json!({ "threadId": thread_id.as_str() });
+        let _ = session.send_request("thread/archive", archive_params).await;
+        return Err(error_msg.to_string());
+    }
+
+    // Collect assistant text from events
+    let mut commit_message = String::new();
+    let timeout_duration = Duration::from_secs(60);
+    let collect_result = timeout(timeout_duration, async {
+        while let Some(event) = rx.recv().await {
+            let method = event.get("method").and_then(|m| m.as_str()).unwrap_or("");
+
+            match method {
+                "item/agentMessage/delta" => {
+                    // Extract text delta from agent messages
+                    if let Some(params) = event.get("params") {
+                        if let Some(delta) = params.get("delta").and_then(|d| d.as_str()) {
+                            commit_message.push_str(delta);
+                        }
+                    }
+                }
+                "turn/completed" => {
+                    // Turn completed, we can stop listening
+                    break;
+                }
+                "turn/error" => {
+                    // Error occurred
+                    let error_msg = event
+                        .get("params")
+                        .and_then(|p| p.get("error"))
+                        .and_then(|e| e.as_str())
+                        .unwrap_or("Unknown error during commit message generation");
+                    return Err(error_msg.to_string());
+                }
+                _ => {
+                    // Ignore other events (turn/started, item/started, item/completed, reasoning events, etc.)
+                }
+            }
+        }
+        Ok(())
+    })
+    .await;
+
+    // Unregister callback
+    {
+        let mut callbacks = session.background_thread_callbacks.lock().await;
+        callbacks.remove(&thread_id);
+    }
+
+    // Archive the thread to clean up
+    let archive_params = json!({ "threadId": thread_id });
+    let _ = session.send_request("thread/archive", archive_params).await;
+
+    // Handle timeout or collection error
+    match collect_result {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => return Err(e),
+        Err(_) => return Err("Timeout waiting for commit message generation".to_string()),
+    }
+
+    let trimmed = commit_message.trim().to_string();
+    if trimmed.is_empty() {
+        return Err("No commit message was generated".to_string());
+    }
+
+    Ok(trimmed)
 }

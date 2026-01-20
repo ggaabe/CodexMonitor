@@ -47,6 +47,7 @@ import { useGitHubPullRequestDiffs } from "./features/git/hooks/useGitHubPullReq
 import { useGitHubPullRequestComments } from "./features/git/hooks/useGitHubPullRequestComments";
 import { useGitRemote } from "./features/git/hooks/useGitRemote";
 import { useGitRepoScan } from "./features/git/hooks/useGitRepoScan";
+import { usePullRequestComposer } from "./features/git/hooks/usePullRequestComposer";
 import { useGitActions } from "./features/git/hooks/useGitActions";
 import { useModels } from "./features/models/hooks/useModels";
 import { useCollaborationModes } from "./features/collaboration/hooks/useCollaborationModes";
@@ -84,15 +85,30 @@ import { useUiScaleShortcuts } from "./features/layout/hooks/useUiScaleShortcuts
 import { useWorkspaceSelection } from "./features/workspaces/hooks/useWorkspaceSelection";
 import { useLocalUsage } from "./features/home/hooks/useLocalUsage";
 import { useNewAgentShortcut } from "./features/app/hooks/useNewAgentShortcut";
+import { useTauriEvent } from "./features/app/hooks/useTauriEvent";
 import { useAgentSoundNotifications } from "./features/notifications/hooks/useAgentSoundNotifications";
 import { useWindowFocusState } from "./features/layout/hooks/useWindowFocusState";
 import { useCopyThread } from "./features/threads/hooks/useCopyThread";
 import { usePanelVisibility } from "./features/layout/hooks/usePanelVisibility";
 import { useTerminalController } from "./features/terminal/hooks/useTerminalController";
 import { playNotificationSound } from "./utils/notificationSounds";
+import { shouldApplyCommitMessage } from "./utils/commitMessage";
 import {
   pickWorkspacePath,
+  generateCommitMessage,
+  commitGit,
+  stageGitAll,
+  pushGit,
+  syncGit,
 } from "./services/tauri";
+import {
+  subscribeMenuAddWorkspace,
+  subscribeMenuNewAgent,
+  subscribeMenuNewCloneAgent,
+  subscribeMenuNewWorktreeAgent,
+  subscribeMenuOpenSettings,
+  subscribeUpdaterCheck,
+} from "./services/events";
 import type {
   AccessMode,
   GitHubPullRequest,
@@ -266,9 +282,33 @@ function MainApp() {
 
   const composerInputRef = useRef<HTMLTextAreaElement | null>(null);
 
-  const updater = useUpdater({ onDebug: addDebugEntry });
+  const {
+    state: updaterState,
+    startUpdate,
+    checkForUpdates,
+    dismiss: dismissUpdate,
+  } = useUpdater({ onDebug: addDebugEntry });
   const isWindowFocused = useWindowFocusState();
   const nextTestSoundIsError = useRef(false);
+  const subscribeUpdaterCheckEvent = useCallback(
+    (handler: () => void) =>
+      subscribeUpdaterCheck(handler, {
+        onError: (error) => {
+          addDebugEntry({
+            id: `${Date.now()}-client-updater-menu-error`,
+            timestamp: Date.now(),
+            source: "error",
+            label: "updater/menu-error",
+            payload: error instanceof Error ? error.message : String(error),
+          });
+        },
+      }),
+    [addDebugEntry],
+  );
+
+  useTauriEvent(subscribeUpdaterCheckEvent, () => {
+    void checkForUpdates({ announceNoUpdate: true });
+  });
 
   useAgentSoundNotifications({
     enabled: appSettings.notificationSoundsEnabled,
@@ -326,9 +366,13 @@ function MainApp() {
     useGitStatus(activeWorkspace);
   const gitStatusRefreshTimeoutRef = useRef<number | null>(null);
   const activeWorkspaceIdRef = useRef<string | null>(activeWorkspace?.id ?? null);
+  const activeWorkspaceRef = useRef(activeWorkspace);
   useEffect(() => {
     activeWorkspaceIdRef.current = activeWorkspace?.id ?? null;
   }, [activeWorkspace?.id]);
+  useEffect(() => {
+    activeWorkspaceRef.current = activeWorkspace;
+  }, [activeWorkspace]);
   useEffect(() => {
     return () => {
       if (gitStatusRefreshTimeoutRef.current !== null) {
@@ -373,7 +417,8 @@ function MainApp() {
     behindEntries: gitLogBehindEntries,
     upstream: gitLogUpstream,
     isLoading: gitLogLoading,
-    error: gitLogError
+    error: gitLogError,
+    refresh: refreshGitLog,
   } = useGitLog(activeWorkspace, shouldLoadGitLog);
   const {
     issues: gitIssues,
@@ -901,6 +946,188 @@ function MainApp() {
     [handleSend],
   );
 
+  // Commit message generation state
+  const [commitMessage, setCommitMessage] = useState("");
+  const [commitMessageLoading, setCommitMessageLoading] = useState(false);
+  const [commitMessageError, setCommitMessageError] = useState<string | null>(null);
+  const hasStagedChanges = gitStatus.stagedFiles.length > 0;
+  const hasUnstagedChanges = gitStatus.unstagedFiles.length > 0;
+  const hasWorktreeChanges = hasStagedChanges || hasUnstagedChanges;
+
+  const ensureStagedForCommit = useCallback(async () => {
+    if (!activeWorkspace || hasStagedChanges || !hasUnstagedChanges) {
+      return;
+    }
+    await stageGitAll(activeWorkspace.id);
+  }, [activeWorkspace, hasStagedChanges, hasUnstagedChanges]);
+
+  const handleCommitMessageChange = useCallback((value: string) => {
+    setCommitMessage(value);
+  }, []);
+
+  const handleGenerateCommitMessage = useCallback(async () => {
+    if (!activeWorkspace || commitMessageLoading) {
+      return;
+    }
+    const workspaceId = activeWorkspace.id;
+    setCommitMessageLoading(true);
+    setCommitMessageError(null);
+    try {
+      // Generate commit message in background
+      const message = await generateCommitMessage(workspaceId);
+      if (!shouldApplyCommitMessage(activeWorkspaceIdRef.current, workspaceId)) {
+        return;
+      }
+      setCommitMessage(message);
+    } catch (error) {
+      if (!shouldApplyCommitMessage(activeWorkspaceIdRef.current, workspaceId)) {
+        return;
+      }
+      setCommitMessageError(
+        error instanceof Error ? error.message : String(error)
+      );
+    } finally {
+      if (shouldApplyCommitMessage(activeWorkspaceIdRef.current, workspaceId)) {
+        setCommitMessageLoading(false);
+      }
+    }
+  }, [activeWorkspace, commitMessageLoading]);
+
+  // Clear commit message state when workspace changes
+  useEffect(() => {
+    setCommitMessage("");
+    setCommitMessageError(null);
+    setCommitMessageLoading(false);
+  }, [activeWorkspaceId]);
+
+  // Git commit/push/sync state
+  const [commitLoading, setCommitLoading] = useState(false);
+  const [pushLoading, setPushLoading] = useState(false);
+  const [syncLoading, setSyncLoading] = useState(false);
+  const [commitError, setCommitError] = useState<string | null>(null);
+  const [pushError, setPushError] = useState<string | null>(null);
+  const [syncError, setSyncError] = useState<string | null>(null);
+
+  const handleCommit = useCallback(async () => {
+    if (!activeWorkspace || commitLoading || !commitMessage.trim() || !hasWorktreeChanges) {
+      return;
+    }
+    setCommitLoading(true);
+    setCommitError(null);
+    try {
+      await ensureStagedForCommit();
+      await commitGit(activeWorkspace.id, commitMessage.trim());
+      setCommitMessage("");
+      // Refresh git status after commit
+      refreshGitStatus();
+      refreshGitLog?.();
+    } catch (error) {
+      setCommitError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setCommitLoading(false);
+    }
+  }, [activeWorkspace, commitLoading, commitMessage, ensureStagedForCommit, hasWorktreeChanges, refreshGitStatus, refreshGitLog]);
+
+  const handleCommitAndPush = useCallback(async () => {
+    if (!activeWorkspace || commitLoading || pushLoading || !commitMessage.trim() || !hasWorktreeChanges) {
+      return;
+    }
+    let commitSucceeded = false;
+    setCommitLoading(true);
+    setPushLoading(true);
+    setCommitError(null);
+    setPushError(null);
+    try {
+      await ensureStagedForCommit();
+      await commitGit(activeWorkspace.id, commitMessage.trim());
+      commitSucceeded = true;
+      setCommitMessage("");
+      setCommitLoading(false);
+      await pushGit(activeWorkspace.id);
+      // Refresh git status after push
+      refreshGitStatus();
+      refreshGitLog?.();
+    } catch (error) {
+      const errorMsg = error instanceof Error ? error.message : String(error);
+      if (!commitSucceeded) {
+        setCommitError(errorMsg);
+      } else {
+        setPushError(errorMsg);
+      }
+    } finally {
+      setCommitLoading(false);
+      setPushLoading(false);
+    }
+  }, [activeWorkspace, commitLoading, pushLoading, commitMessage, ensureStagedForCommit, hasWorktreeChanges, refreshGitStatus, refreshGitLog]);
+
+  const handleCommitAndSync = useCallback(async () => {
+    if (!activeWorkspace || commitLoading || syncLoading || !commitMessage.trim() || !hasWorktreeChanges) {
+      return;
+    }
+    let commitSucceeded = false;
+    setCommitLoading(true);
+    setSyncLoading(true);
+    setCommitError(null);
+    setSyncError(null);
+    try {
+      await ensureStagedForCommit();
+      await commitGit(activeWorkspace.id, commitMessage.trim());
+      commitSucceeded = true;
+      setCommitMessage("");
+      setCommitLoading(false);
+      await syncGit(activeWorkspace.id);
+      // Refresh git status after sync
+      refreshGitStatus();
+      refreshGitLog?.();
+    } catch (error) {
+      const errorMsg = error instanceof Error ? error.message : String(error);
+      if (!commitSucceeded) {
+        setCommitError(errorMsg);
+      } else {
+        setSyncError(errorMsg);
+      }
+    } finally {
+      setCommitLoading(false);
+      setSyncLoading(false);
+    }
+  }, [activeWorkspace, commitLoading, syncLoading, commitMessage, ensureStagedForCommit, hasWorktreeChanges, refreshGitStatus, refreshGitLog]);
+
+  const handlePush = useCallback(async () => {
+    if (!activeWorkspace || pushLoading) {
+      return;
+    }
+    setPushLoading(true);
+    setPushError(null);
+    try {
+      await pushGit(activeWorkspace.id);
+      // Refresh git status after push
+      refreshGitStatus();
+      refreshGitLog?.();
+    } catch (error) {
+      setPushError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setPushLoading(false);
+    }
+  }, [activeWorkspace, pushLoading, refreshGitStatus, refreshGitLog]);
+
+  const handleSync = useCallback(async () => {
+    if (!activeWorkspace || syncLoading) {
+      return;
+    }
+    setSyncLoading(true);
+    setSyncError(null);
+    try {
+      await syncGit(activeWorkspace.id);
+      // Refresh git status after sync
+      refreshGitStatus();
+      refreshGitLog?.();
+    } catch (error) {
+      setSyncError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setSyncLoading(false);
+    }
+  }, [activeWorkspace, syncLoading, refreshGitStatus, refreshGitLog]);
+
   const handleSendPromptToNewAgent = useCallback(
     async (text: string) => {
       const trimmed = text.trim();
@@ -920,6 +1147,7 @@ function MainApp() {
     },
     [activeWorkspace, connectWorkspace, sendUserMessageToThread, startThreadForWorkspace],
   );
+
 
   const handleCreatePrompt = useCallback(
     async (data: {
@@ -1002,6 +1230,11 @@ function MainApp() {
   const worktreeLabel = isWorktreeWorkspace
     ? activeWorkspace?.worktree?.branch ?? activeWorkspace?.name ?? null
     : null;
+  const baseWorkspaceRef = useRef(activeParentWorkspace ?? activeWorkspace);
+
+  useEffect(() => {
+    baseWorkspaceRef.current = activeParentWorkspace ?? activeWorkspace;
+  }, [activeParentWorkspace, activeWorkspace]);
 
   useEffect(() => {
     if (!isPhone) {
@@ -1034,16 +1267,7 @@ function MainApp() {
     listThreadsForWorkspace
   });
 
-  useNewAgentShortcut({
-    isEnabled: Boolean(activeWorkspace),
-    onTrigger: () => {
-      if (activeWorkspace) {
-        void handleAddAgent(activeWorkspace);
-      }
-    },
-  });
-
-  async function handleAddWorkspace() {
+  const handleAddWorkspace = useCallback(async () => {
     try {
       const workspace = await addWorkspace();
       if (workspace) {
@@ -1063,34 +1287,56 @@ function MainApp() {
       });
       alert(`Failed to add workspace.\n\n${message}`);
     }
-  }
+  }, [addDebugEntry, addWorkspace, isCompact, setActiveTab, setActiveThreadId]);
 
+  const handleAddAgent = useCallback(
+    async (workspace: (typeof workspaces)[number]) => {
+      exitDiffView();
+      selectWorkspace(workspace.id);
+      if (!workspace.connected) {
+        await connectWorkspace(workspace);
+      }
+      await startThreadForWorkspace(workspace.id);
+      if (isCompact) {
+        setActiveTab("codex");
+      }
+      // Focus the composer input after creating the agent
+      setTimeout(() => composerInputRef.current?.focus(), 0);
+    },
+    [
+      connectWorkspace,
+      exitDiffView,
+      isCompact,
+      selectWorkspace,
+      setActiveTab,
+      startThreadForWorkspace,
+    ],
+  );
 
-  async function handleAddAgent(workspace: (typeof workspaces)[number]) {
-    exitDiffView();
-    selectWorkspace(workspace.id);
-    if (!workspace.connected) {
-      await connectWorkspace(workspace);
-    }
-    await startThreadForWorkspace(workspace.id);
-    if (isCompact) {
-      setActiveTab("codex");
-    }
-    // Focus the composer input after creating the agent
-    setTimeout(() => composerInputRef.current?.focus(), 0);
-  }
+  const handleAddWorktreeAgent = useCallback(
+    async (workspace: (typeof workspaces)[number]) => {
+      exitDiffView();
+      openWorktreePrompt(workspace);
+    },
+    [exitDiffView, openWorktreePrompt],
+  );
 
-  async function handleAddWorktreeAgent(
-    workspace: (typeof workspaces)[number]
-  ) {
-    exitDiffView();
-    openWorktreePrompt(workspace);
-  }
+  const handleAddCloneAgent = useCallback(
+    async (workspace: (typeof workspaces)[number]) => {
+      exitDiffView();
+      openClonePrompt(workspace);
+    },
+    [exitDiffView, openClonePrompt],
+  );
 
-  async function handleAddCloneAgent(workspace: (typeof workspaces)[number]) {
-    exitDiffView();
-    openClonePrompt(workspace);
-  }
+  useNewAgentShortcut({
+    isEnabled: Boolean(activeWorkspace),
+    onTrigger: () => {
+      if (activeWorkspace) {
+        void handleAddAgent(activeWorkspace);
+      }
+    },
+  });
 
   function handleSelectDiff(path: string) {
     setSelectedDiffPath(path);
@@ -1131,16 +1377,34 @@ function MainApp() {
     pendingDiffScrollRef.current = false;
   }, [activeDiffs, centerMode, selectedDiffPath]);
 
-  function handleSelectPullRequest(pullRequest: GitHubPullRequest) {
-    setSelectedPullRequest(pullRequest);
-    setDiffSource("pr");
-    setSelectedDiffPath(null);
-    setCenterMode("diff");
-    setGitPanelMode("prs");
-    if (isCompact) {
-      setActiveTab("git");
-    }
-  }
+  const {
+    handleSelectPullRequest,
+    resetPullRequestSelection,
+    composerSendLabel,
+    handleComposerSend,
+    handleComposerQueue,
+  } = usePullRequestComposer({
+    activeWorkspace,
+    selectedPullRequest,
+    gitPullRequestDiffs,
+    filePanelMode,
+    gitPanelMode,
+    centerMode,
+    isCompact,
+    setSelectedPullRequest,
+    setDiffSource,
+    setSelectedDiffPath,
+    setCenterMode,
+    setGitPanelMode,
+    setPrefillDraft,
+    setActiveTab,
+    connectWorkspace,
+    startThreadForWorkspace,
+    sendUserMessageToThread,
+    clearActiveImages,
+    handleSend,
+    queueMessage,
+  });
 
   function handleGitPanelModeChange(
     mode: "diff" | "log" | "issues" | "prs",
@@ -1163,6 +1427,35 @@ function MainApp() {
     },
     [],
   );
+
+  useTauriEvent(subscribeMenuNewAgent, () => {
+    const workspace = activeWorkspaceRef.current;
+    if (workspace) {
+      void handleAddAgent(workspace);
+    }
+  });
+
+  useTauriEvent(subscribeMenuNewWorktreeAgent, () => {
+    const workspace = baseWorkspaceRef.current;
+    if (workspace) {
+      void handleAddWorktreeAgent(workspace);
+    }
+  });
+
+  useTauriEvent(subscribeMenuNewCloneAgent, () => {
+    const workspace = baseWorkspaceRef.current;
+    if (workspace) {
+      void handleAddCloneAgent(workspace);
+    }
+  });
+
+  useTauriEvent(subscribeMenuAddWorkspace, () => {
+    void handleAddWorkspace();
+  });
+
+  useTauriEvent(subscribeMenuOpenSettings, () => {
+    handleOpenSettings();
+  });
 
   const orderValue = (entry: WorkspaceInfo) =>
     typeof entry.settings.sortOrder === "number"
@@ -1292,9 +1585,13 @@ function MainApp() {
     onOpenDebug: handleDebugClick,
     showDebugButton,
     onAddWorkspace: handleAddWorkspace,
-    onSelectHome: selectHome,
+    onSelectHome: () => {
+      resetPullRequestSelection();
+      selectHome();
+    },
     onSelectWorkspace: (workspaceId) => {
       exitDiffView();
+      resetPullRequestSelection();
       selectWorkspace(workspaceId);
     },
     onConnectWorkspace: async (workspace) => {
@@ -1318,6 +1615,7 @@ function MainApp() {
     },
     onSelectThread: (workspaceId, threadId) => {
       exitDiffView();
+      resetPullRequestSelection();
       selectWorkspace(workspaceId);
       setActiveThreadId(threadId, workspaceId);
     },
@@ -1359,9 +1657,9 @@ function MainApp() {
       }
       void listThreadsForWorkspace(workspace);
     },
-    updaterState: updater.state,
-    onUpdate: updater.startUpdate,
-    onDismissUpdate: updater.dismiss,
+    updaterState,
+    onUpdate: startUpdate,
+    onDismissUpdate: dismissUpdate,
     latestAgentRuns,
     isLoadingLatestAgents,
     localUsageSnapshot,
@@ -1472,6 +1770,23 @@ function MainApp() {
     gitDiffLoading: activeDiffLoading,
     gitDiffError: activeDiffError,
     onDiffActivePathChange: handleActiveDiffPath,
+    commitMessage,
+    commitMessageLoading,
+    commitMessageError,
+    onCommitMessageChange: handleCommitMessageChange,
+    onGenerateCommitMessage: handleGenerateCommitMessage,
+    onCommit: handleCommit,
+    onCommitAndPush: handleCommitAndPush,
+    onCommitAndSync: handleCommitAndSync,
+    onPush: handlePush,
+    onSync: handleSync,
+    commitLoading,
+    pushLoading,
+    syncLoading,
+    commitError,
+    pushError,
+    syncError,
+    commitsAhead: gitLogAhead,
     onSendPrompt: handleSendPrompt,
     onSendPromptToNewAgent: handleSendPromptToNewAgent,
     onCreatePrompt: handleCreatePrompt,
@@ -1480,8 +1795,8 @@ function MainApp() {
     onMovePrompt: handleMovePrompt,
     onRevealWorkspacePrompts: handleRevealWorkspacePrompts,
     onRevealGeneralPrompts: handleRevealGeneralPrompts,
-    onSend: handleSend,
-    onQueue: queueMessage,
+    onSend: handleComposerSend,
+    onQueue: handleComposerQueue,
     onStop: interruptTurn,
     canStop: canInterrupt,
     isReviewing,
@@ -1548,6 +1863,7 @@ function MainApp() {
     onDismissDictationError: clearDictationError,
     dictationHint,
     onDismissDictationHint: clearDictationHint,
+    composerSendLabel,
     showComposer,
     plan: activePlan,
     debugEntries,
