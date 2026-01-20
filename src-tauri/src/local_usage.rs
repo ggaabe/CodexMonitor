@@ -1,6 +1,6 @@
-use chrono::{DateTime, Duration, Local};
+use chrono::{DateTime, Duration, Local, TimeZone, Utc};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -23,6 +23,8 @@ struct UsageTotals {
     cached: i64,
     output: i64,
 }
+
+const MAX_ACTIVITY_GAP_MS: i64 = 2 * 60 * 1000;
 
 #[tauri::command]
 pub(crate) async fn local_usage_snapshot(
@@ -77,7 +79,7 @@ fn scan_local_usage(days: u32, workspace_path: Option<&Path>) -> Result<LocalUsa
             if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
                 continue;
             }
-            scan_file(&path, day_key, &mut daily, &mut model_totals, workspace_path)?;
+            scan_file(&path, &mut daily, &mut model_totals, workspace_path)?;
         }
     }
 
@@ -165,7 +167,6 @@ fn build_snapshot(
 
 fn scan_file(
     path: &Path,
-    day_key: &str,
     daily: &mut HashMap<String, DailyTotals>,
     model_totals: &mut HashMap<String, i64>,
     workspace_path: Option<&Path>,
@@ -179,7 +180,8 @@ fn scan_file(
     let reader = BufReader::new(file);
     let mut previous_totals: Option<UsageTotals> = None;
     let mut current_model: Option<String> = None;
-    let mut pending_start_ms: Option<i64> = None;
+    let mut last_activity_ms: Option<i64> = None;
+    let mut seen_runs: HashSet<i64> = HashSet::new();
     let mut match_known = workspace_path.is_none();
     let mut matches_workspace = workspace_path.is_none();
 
@@ -241,9 +243,23 @@ fn scan_file(
                 .and_then(|payload| payload.get("type"))
                 .and_then(|value| value.as_str());
 
-            if payload_type == Some("user_message") {
+            if payload_type == Some("agent_message") {
                 if let Some(timestamp_ms) = read_timestamp_ms(&value) {
-                    pending_start_ms = Some(timestamp_ms);
+                    if seen_runs.insert(timestamp_ms) {
+                        if let Some(day_key) = day_key_for_timestamp_ms(timestamp_ms) {
+                            if let Some(entry) = daily.get_mut(&day_key) {
+                                entry.agent_runs += 1;
+                            }
+                        }
+                    }
+                    track_activity(daily, &mut last_activity_ms, timestamp_ms);
+                }
+                continue;
+            }
+
+            if payload_type == Some("agent_reasoning") {
+                if let Some(timestamp_ms) = read_timestamp_ms(&value) {
+                    track_activity(daily, &mut last_activity_ms, timestamp_ms);
                 }
                 continue;
             }
@@ -323,17 +339,25 @@ fn scan_file(
                 continue;
             }
 
-            let cached = delta.cached.min(delta.input);
-            let entry = daily.entry(day_key.to_string()).or_default();
-            entry.input += delta.input;
-            entry.cached += cached;
-            entry.output += delta.output;
+            let timestamp_ms = read_timestamp_ms(&value);
+            if let Some(day_key) = timestamp_ms.and_then(|ms| day_key_for_timestamp_ms(ms)) {
+                if let Some(entry) = daily.get_mut(&day_key) {
+                    let cached = delta.cached.min(delta.input);
+                    entry.input += delta.input;
+                    entry.cached += cached;
+                    entry.output += delta.output;
 
-            let model = current_model
-                .clone()
-                .or_else(|| extract_model_from_token_count(&value))
-                .unwrap_or_else(|| "unknown".to_string());
-            *model_totals.entry(model).or_insert(0) += delta.input + delta.output;
+                    let model = current_model
+                        .clone()
+                        .or_else(|| extract_model_from_token_count(&value))
+                        .unwrap_or_else(|| "unknown".to_string());
+                    *model_totals.entry(model).or_insert(0) += delta.input + delta.output;
+                }
+            }
+
+            if let Some(timestamp_ms) = timestamp_ms {
+                track_activity(daily, &mut last_activity_ms, timestamp_ms);
+            }
             continue;
         }
 
@@ -342,29 +366,25 @@ fn scan_file(
             let payload_type = payload
                 .and_then(|payload| payload.get("type"))
                 .and_then(|value| value.as_str());
-            if payload_type != Some("message") {
-                continue;
-            }
             let role = payload
                 .and_then(|payload| payload.get("role"))
                 .and_then(|value| value.as_str())
                 .unwrap_or("");
 
             if role == "assistant" {
-                if let (Some(start_ms), Some(end_ms)) =
-                    (pending_start_ms, read_timestamp_ms(&value))
-                {
-                    let duration_ms = (end_ms - start_ms).max(0);
-                    if duration_ms > 0 {
-                        let entry = daily.entry(day_key.to_string()).or_default();
-                        entry.agent_ms += duration_ms;
-                        entry.agent_runs += 1;
-                    }
-                }
-                pending_start_ms = None;
-            } else if role == "user" && pending_start_ms.is_none() {
                 if let Some(timestamp_ms) = read_timestamp_ms(&value) {
-                    pending_start_ms = Some(timestamp_ms);
+                    if seen_runs.insert(timestamp_ms) {
+                        if let Some(day_key) = day_key_for_timestamp_ms(timestamp_ms) {
+                            if let Some(entry) = daily.get_mut(&day_key) {
+                                entry.agent_runs += 1;
+                            }
+                        }
+                    }
+                    track_activity(daily, &mut last_activity_ms, timestamp_ms);
+                }
+            } else if payload_type != Some("message") {
+                if let Some(timestamp_ms) = read_timestamp_ms(&value) {
+                    track_activity(daily, &mut last_activity_ms, timestamp_ms);
                 }
             }
         }
@@ -427,6 +447,29 @@ fn read_timestamp_ms(value: &Value) -> Option<i64> {
         return Some(numeric * 1000);
     }
     Some(numeric)
+}
+
+fn track_activity(
+    daily: &mut HashMap<String, DailyTotals>,
+    last_activity_ms: &mut Option<i64>,
+    timestamp_ms: i64,
+) {
+    if let Some(prev_ms) = *last_activity_ms {
+        let delta = timestamp_ms - prev_ms;
+        if delta > 0 && delta <= MAX_ACTIVITY_GAP_MS {
+            if let Some(day_key) = day_key_for_timestamp_ms(timestamp_ms) {
+                if let Some(entry) = daily.get_mut(&day_key) {
+                    entry.agent_ms += delta;
+                }
+            }
+        }
+    }
+    *last_activity_ms = Some(timestamp_ms);
+}
+
+fn day_key_for_timestamp_ms(timestamp_ms: i64) -> Option<String> {
+    let utc = Utc.timestamp_millis_opt(timestamp_ms).single()?;
+    Some(utc.with_timezone(&Local).format("%Y-%m-%d").to_string())
 }
 
 fn extract_cwd(value: &Value) -> Option<String> {
@@ -515,14 +558,14 @@ mod tests {
     fn scan_file_does_not_double_count_last_and_total_usage() {
         let day_key = "2026-01-19";
         let path = write_temp_jsonl(&[
-            r#"{"payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":10,"cached_input_tokens":0,"output_tokens":5}}}}"#,
-            r#"{"payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":10,"cached_input_tokens":0,"output_tokens":5}}}}"#,
+            r#"{"timestamp":"2026-01-19T12:00:00.000Z","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":10,"cached_input_tokens":0,"output_tokens":5}}}}"#,
+            r#"{"timestamp":"2026-01-19T12:00:01.000Z","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":10,"cached_input_tokens":0,"output_tokens":5}}}}"#,
         ]);
 
         let mut daily: HashMap<String, DailyTotals> = HashMap::new();
+        daily.insert(day_key.to_string(), DailyTotals::default());
         let mut model_totals: HashMap<String, i64> = HashMap::new();
-        scan_file(&path, day_key, &mut daily, &mut model_totals, None)
-            .expect("scan file");
+        scan_file(&path, &mut daily, &mut model_totals, None).expect("scan file");
 
         let totals = daily.get(day_key).copied().unwrap_or_default();
         assert_eq!(totals.input, 10);
@@ -533,14 +576,14 @@ mod tests {
     fn scan_file_counts_last_deltas_before_total_snapshot_once() {
         let day_key = "2026-01-19";
         let path = write_temp_jsonl(&[
-            r#"{"payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":10,"cached_input_tokens":0,"output_tokens":5}}}}"#,
-            r#"{"payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":20,"cached_input_tokens":0,"output_tokens":10}}}}"#,
+            r#"{"timestamp":"2026-01-19T12:00:00.000Z","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":10,"cached_input_tokens":0,"output_tokens":5}}}}"#,
+            r#"{"timestamp":"2026-01-19T12:00:01.000Z","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":20,"cached_input_tokens":0,"output_tokens":10}}}}"#,
         ]);
 
         let mut daily: HashMap<String, DailyTotals> = HashMap::new();
+        daily.insert(day_key.to_string(), DailyTotals::default());
         let mut model_totals: HashMap<String, i64> = HashMap::new();
-        scan_file(&path, day_key, &mut daily, &mut model_totals, None)
-            .expect("scan file");
+        scan_file(&path, &mut daily, &mut model_totals, None).expect("scan file");
 
         let totals = daily.get(day_key).copied().unwrap_or_default();
         assert_eq!(totals.input, 20);
@@ -551,15 +594,15 @@ mod tests {
     fn scan_file_does_not_double_count_last_between_total_snapshots() {
         let day_key = "2026-01-19";
         let path = write_temp_jsonl(&[
-            r#"{"payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":10,"cached_input_tokens":0,"output_tokens":5}}}}"#,
-            r#"{"payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":2,"cached_input_tokens":0,"output_tokens":1}}}}"#,
-            r#"{"payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":12,"cached_input_tokens":0,"output_tokens":6}}}}"#,
+            r#"{"timestamp":"2026-01-19T12:00:00.000Z","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":10,"cached_input_tokens":0,"output_tokens":5}}}}"#,
+            r#"{"timestamp":"2026-01-19T12:00:01.000Z","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":2,"cached_input_tokens":0,"output_tokens":1}}}}"#,
+            r#"{"timestamp":"2026-01-19T12:00:02.000Z","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":12,"cached_input_tokens":0,"output_tokens":6}}}}"#,
         ]);
 
         let mut daily: HashMap<String, DailyTotals> = HashMap::new();
+        daily.insert(day_key.to_string(), DailyTotals::default());
         let mut model_totals: HashMap<String, i64> = HashMap::new();
-        scan_file(&path, day_key, &mut daily, &mut model_totals, None)
-            .expect("scan file");
+        scan_file(&path, &mut daily, &mut model_totals, None).expect("scan file");
 
         let totals = daily.get(day_key).copied().unwrap_or_default();
         assert_eq!(totals.input, 12);
@@ -567,38 +610,71 @@ mod tests {
     }
 
     #[test]
-    fn scan_file_tracks_agent_time_from_user_to_assistant() {
+    fn scan_file_tracks_agent_time_from_activity() {
         let day_key = "2026-01-19";
         let path = write_temp_jsonl(&[
-            r#"{"timestamp":"2026-01-19T06:00:00.000Z","type":"event_msg","payload":{"type":"user_message","message":"hi"}}"#,
-            r#"{"timestamp":"2026-01-19T06:00:10.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}}"#,
+            r#"{"timestamp":"2026-01-19T12:00:00.000Z","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1,"cached_input_tokens":0,"output_tokens":1}}}}"#,
+            r#"{"timestamp":"2026-01-19T12:00:05.000Z","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":2,"cached_input_tokens":0,"output_tokens":2}}}}"#,
         ]);
 
         let mut daily: HashMap<String, DailyTotals> = HashMap::new();
+        daily.insert(day_key.to_string(), DailyTotals::default());
         let mut model_totals: HashMap<String, i64> = HashMap::new();
-        scan_file(&path, day_key, &mut daily, &mut model_totals, None)
-            .expect("scan file");
+        scan_file(&path, &mut daily, &mut model_totals, None).expect("scan file");
+
+        let totals = daily.get(day_key).copied().unwrap_or_default();
+        assert_eq!(totals.agent_ms, 5_000);
+    }
+
+    #[test]
+    fn scan_file_counts_runs_from_assistant_messages() {
+        let day_key = "2026-01-19";
+        let path = write_temp_jsonl(&[
+            r#"{"timestamp":"2026-01-19T12:00:05.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"a"}]}}"#,
+            r#"{"timestamp":"2026-01-19T12:00:10.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"b"}]}}"#,
+        ]);
+
+        let mut daily: HashMap<String, DailyTotals> = HashMap::new();
+        daily.insert(day_key.to_string(), DailyTotals::default());
+        let mut model_totals: HashMap<String, i64> = HashMap::new();
+        scan_file(&path, &mut daily, &mut model_totals, None).expect("scan file");
+
+        let totals = daily.get(day_key).copied().unwrap_or_default();
+        assert_eq!(totals.agent_runs, 2);
+    }
+
+    #[test]
+    fn scan_file_ignores_large_gaps_between_activity() {
+        let day_key = "2026-01-19";
+        let path = write_temp_jsonl(&[
+            r#"{"timestamp":"2026-01-19T12:00:00.000Z","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1,"cached_input_tokens":0,"output_tokens":1}}}}"#,
+            r#"{"timestamp":"2026-01-19T12:10:00.000Z","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":2,"cached_input_tokens":0,"output_tokens":2}}}}"#,
+            r#"{"timestamp":"2026-01-19T12:10:10.000Z","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":3,"cached_input_tokens":0,"output_tokens":3}}}}"#,
+        ]);
+
+        let mut daily: HashMap<String, DailyTotals> = HashMap::new();
+        daily.insert(day_key.to_string(), DailyTotals::default());
+        let mut model_totals: HashMap<String, i64> = HashMap::new();
+        scan_file(&path, &mut daily, &mut model_totals, None).expect("scan file");
 
         let totals = daily.get(day_key).copied().unwrap_or_default();
         assert_eq!(totals.agent_ms, 10_000);
-        assert_eq!(totals.agent_runs, 1);
     }
 
     #[test]
     fn scan_file_skips_workspace_mismatch() {
         let day_key = "2026-01-19";
         let path = write_temp_jsonl(&[
-            r#"{"timestamp":"2026-01-19T06:00:00.000Z","type":"session_meta","payload":{"cwd":"/tmp/project-alpha"}}"#,
-            r#"{"timestamp":"2026-01-19T06:00:00.000Z","type":"event_msg","payload":{"type":"user_message","message":"hi"}}"#,
-            r#"{"timestamp":"2026-01-19T06:00:10.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}}"#,
-            r#"{"payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":10,"cached_input_tokens":0,"output_tokens":5}}}}"#,
+            r#"{"timestamp":"2026-01-19T12:00:00.000Z","type":"session_meta","payload":{"cwd":"/tmp/project-alpha"}}"#,
+            r#"{"timestamp":"2026-01-19T12:00:10.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}}"#,
+            r#"{"timestamp":"2026-01-19T12:00:12.000Z","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":10,"cached_input_tokens":0,"output_tokens":5}}}}"#,
         ]);
 
         let mut daily: HashMap<String, DailyTotals> = HashMap::new();
+        daily.insert(day_key.to_string(), DailyTotals::default());
         let mut model_totals: HashMap<String, i64> = HashMap::new();
         scan_file(
             &path,
-            day_key,
             &mut daily,
             &mut model_totals,
             Some(Path::new("/tmp/other-project")),
